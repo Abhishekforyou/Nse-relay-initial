@@ -1,17 +1,12 @@
-# NSE Relay API
+# Golden Filter Pro API
 
-A lightweight Node.js proxy to fetch NSE India stock data using authenticated proxy access.
+This is a minimal Express-based API for running the Golden Filter Pro scan with live NSE integration.
 
-## Usage
+## Available Routes
 
-Deploy this using Railway or any Docker-compatible host.
+- `/` — Health check
+- `/scan` — Trigger the Golden Filter Pro scan
 
-### API Endpoint
+## Deployment
 
-```
-GET /api/stock?symbol=TCS
-```
-
-### Environment Variables
-
-Refer to `.env.example` for required keys.
+Use Docker or Railway to deploy this Node.js service.
