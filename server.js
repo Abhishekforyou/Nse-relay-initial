@@ -25,9 +25,44 @@ function nowIST() {
 
 let browser;
 async function withPage(fn) {
-  if (!browser) browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ timezoneId: TZ, locale: "en-IN" });
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--disable-http2",
+        "--no-sandbox",               // safe on Railway
+        "--disable-dev-shm-usage"
+      ]
+    });
+  }
+
+  const UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+  const ctx = await browser.newContext({
+    timezoneId: TZ,
+    locale: "en-IN",
+    userAgent: UA
+  });
+
   const page = await ctx.newPage();
+
+  // Realistic default headers for all requests
+  await page.setExtraHTTPHeaders({
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/"
+  });
+
+  // Preload homepage to get required cookies (bm_sv / ak_bmsc)
+  await page.goto("https://www.nseindia.com/", {
+    waitUntil: "domcontentloaded",
+    timeout: 45000
+  });
+
   try {
     const result = await fn(page);
     await ctx.close();
