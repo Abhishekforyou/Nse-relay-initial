@@ -1,39 +1,37 @@
-
 const express = require('express');
 const axios = require('axios');
 const HttpsProxyAgent = require('https-proxy-agent');
+const cors = require('cors');
 
 const app = express();
-const port = process.env.PORT || 3000;
+app.use(cors());
 
-require('dotenv').config();
+const PORT = process.env.PORT || 3000;
 
-app.get('/scan', async (req, res) => {
+const proxy = 'http://lmykedsz-1:8so8ew9nssb4@p.webshare.io:80';
+const agent = new HttpsProxyAgent(proxy);
+
+app.get('/api/stock', async (req, res) => {
+  const { symbol } = req.query;
+
   try {
-    const proxyHost = process.env.PROXY_HOST;
-    const proxyPort = parseInt(process.env.PROXY_PORT);
-    const proxyUser = process.env.PROXY_USERNAME;
-    const proxyPass = process.env.PROXY_PASSWORD;
-
-    const proxyUrl = `http://${proxyUser}:${proxyPass}@${proxyHost}:${proxyPort}`;
-    const agent = new HttpsProxyAgent(proxyUrl);
-
-    const response = await axios.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050', {
+    const response = await axios.get(`https://www.nseindia.com/api/quote-equity?symbol=${symbol}`, {
       httpsAgent: agent,
       headers: {
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json',
+        'Referer': 'https://www.nseindia.com/',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-US,en;q=0.9'
       }
     });
-
     res.json(response.data);
   } catch (error) {
-    res.status(500).json({
-      error: 'Failed to fetch data',
-      details: error.message
-    });
+    console.error('Error fetching stock data:', error.message);
+    res.status(500).json({ error: 'Failed to fetch stock data' });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
