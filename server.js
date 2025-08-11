@@ -1,4 +1,4 @@
-// server.js  — NSE Relay (Express + Playwright) with IST + freshness guards
+// server.js — NSE Relay (Express + Playwright) with IST + freshness guards
 
 import express from "express";
 import pino from "pino";
@@ -13,7 +13,7 @@ const TZ = process.env.TZ || "Asia/Kolkata";
 const MAX_AGE_LIVE_SECONDS = parseInt(process.env.MAX_AGE_LIVE_SECONDS || "3", 10);
 const MAX_AGE_DELAYED_SECONDS = parseInt(process.env.MAX_AGE_DELAYED_SECONDS || "900", 10); // 15m
 
-// ---- time helpers (IST) -----------------------------------------------------
+// ---------- IST helpers ----------
 function nowIST() {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: TZ,
@@ -25,7 +25,7 @@ function nowIST() {
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}+05:30`;
 }
 
-// ---- browser + page bootstrap (HTTP/2 off, real UA, cookie warmup) ----------
+// ---------- Browser bootstrap (HTTP/2 off, real UA, cookie warm-up) ----------
 let browser;
 async function withPage(fn) {
   if (!browser) {
@@ -39,7 +39,8 @@ async function withPage(fn) {
     });
   }
 
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
   const ctx = await browser.newContext({
     timezoneId: TZ,
@@ -58,7 +59,7 @@ async function withPage(fn) {
     "Referer": "https://www.nseindia.com/"
   });
 
-  // Warm up cookies (bm_sv / ak_bmsc) once per context
+  // Warm cookies (ak_bmsc/bm_sv) once per context
   await page.goto("https://www.nseindia.com/", {
     waitUntil: "domcontentloaded",
     timeout: 45000
@@ -74,7 +75,7 @@ async function withPage(fn) {
   }
 }
 
-// ---- robust JSON fetcher with retries (focus of Step 2) ---------------------
+// ---------- Robust JSON fetcher w/ retries ----------
 async function fetchJSONOnce(page, url) {
   const res = await page.request.get(url, {
     headers: {
@@ -92,23 +93,20 @@ async function fetchJSONOnce(page, url) {
 async function fetchJSON(page, url, tries = 3, backoffMs = 700) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
-    try {
-      return await fetchJSONOnce(page, url);
-    } catch (e) {
+    try { return await fetchJSONOnce(page, url); }
+    catch (e) {
       lastErr = e;
-      if (i < tries - 1) {
-        await new Promise(r => setTimeout(r, backoffMs * (i + 1))); // linear backoff
-      }
+      if (i < tries - 1) await new Promise(r => setTimeout(r, backoffMs * (i + 1)));
     }
   }
   throw lastErr;
 }
 
-// ---- NSE helpers -------------------------------------------------------------
+// ---------- NSE helpers ----------
 async function getSnapshotsFromIndex(page) {
   const idx = encodeURIComponent("NIFTY 200");
   const data = await fetchJSON(page, `https://www.nseindia.com/api/equity-stockIndices?index=${idx}`);
-  const ts = data?.metadata?.lastUpdateTime; // e.g., "11-Aug-2025 09:14:57"
+  const ts = data?.metadata?.lastUpdateTime; // e.g. "11-Aug-2025 09:14:57"
   const rows = (data?.data || []).map(r => ({
     symbol: r.symbol,
     ltp: r.lastPrice,
@@ -127,13 +125,11 @@ function parseNSETimeToIST(tsStr) {
     const mm = months[monStr];
     const [hh, min, ss] = tpart.split(":");
     return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}+05:30`;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 function checkFreshness(istISO, mode = "delayed") {
-  if (!istISO) return { ok: false, ageSec: Infinity, maxAge: 0 };
+  if (!istISO) return { ok:false, ageSec: Infinity, maxAge: 0 };
   const now = Date.now();
   const ts = new Date(istISO).getTime();
   const ageSec = Math.max(0, Math.round((now - ts) / 1000));
@@ -141,14 +137,18 @@ function checkFreshness(istISO, mode = "delayed") {
   return { ok: ageSec <= maxAge, ageSec, maxAge };
 }
 
-// ---- routes -----------------------------------------------------------------
+// ---------- Routes ----------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("NSE relay up");
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, tz: TZ, now_ist: nowIST() });
 });
 
 const QuerySchema = z.object({
-  universe: z.string().optional(),      // currently supports nifty200
-  mode: z.enum(["live", "delayed"]).default("delayed")
+  universe: z.string().optional(),          // currently supports nifty200
+  mode: z.enum(["live","delayed"]).default("delayed")
 });
 
 app.get("/api/nse/snapshot", async (req, res) => {
@@ -159,32 +159,23 @@ app.get("/api/nse/snapshot", async (req, res) => {
 
   try {
     await withPage(async (page) => {
-      // fetch nifty200 snapshot
       const snap = await getSnapshotsFromIndex(page);
-
       const istISO = parseNSETimeToIST(snap.ts);
       const freshness = checkFreshness(istISO, q.mode);
 
-      // hard same-day check (IST)
-      const todayIST = nowIST().slice(0, 10);           // YYYY-MM-DD
-      const snapDay = istISO ? istISO.slice(0, 10) : null;
+      // same-day (IST) guard
+      const todayIST = nowIST().slice(0,10);
+      const snapDay = istISO ? istISO.slice(0,10) : null;
       if (snapDay !== todayIST) {
         res.setHeader("X-Data-TS-IST", istISO || "unknown");
         res.setHeader("X-Freshness-Seconds", String(freshness.ageSec));
-        return res.status(412).json({
-          ok: false, error: "WRONG_DATE",
-          expected_day: todayIST, got_day: snapDay, ts: istISO
-        });
+        return res.status(412).json({ ok:false, error:"WRONG_DATE", expected_day: todayIST, got_day: snapDay, ts: istISO });
       }
 
       if (!freshness.ok) {
         res.setHeader("X-Data-TS-IST", istISO || "unknown");
         res.setHeader("X-Freshness-Seconds", String(freshness.ageSec));
-        return res.status(412).json({
-          ok: false, error: "DATA_TOO_OLD",
-          max_age_seconds: freshness.maxAge,
-          age_seconds: freshness.ageSec, ts: istISO
-        });
+        return res.status(412).json({ ok:false, error:"DATA_TOO_OLD", max_age_seconds: freshness.maxAge, age_seconds: freshness.ageSec, ts: istISO });
       }
 
       res.setHeader("Cache-Control", "no-store");
@@ -193,22 +184,24 @@ app.get("/api/nse/snapshot", async (req, res) => {
       res.setHeader("X-Source", "nse-public-headless");
 
       return res.json({
-        meta: {
-          scan_time_ist: nowIST(),
-          universe: "nifty200",
-          count: snap.rows.length
-        },
+        meta: { scan_time_ist: nowIST(), universe: "nifty200", count: snap.rows.length },
         symbols: snap.rows
       });
     });
   } catch (e) {
     log.error(e, "snapshot_error");
-    res.status(503).json({ ok: false, error: "UPSTREAM_UNAVAILABLE", message: e.message });
+    res.status(503).json({ ok:false, error:"UPSTREAM_UNAVAILABLE", message: e.message });
   }
 });
 
-// graceful shutdown
-process.on("SIGTERM", async () => { if (browser) await browser.close(); process.exit(0); });
-process.on("SIGINT",  async () => { if (browser) await browser.close(); process.exit(0); });
+// ---------- Keep server alive ----------
+const server = app.listen(PORT, () => {
+  log.info({ port: PORT, tz: TZ }, "NSE relay up");
+});
 
-app.listen(PORT, () => log.info({ port: PORT, tz: TZ }, "NSE relay up"));
+// Graceful shutdown
+process.on("SIGTERM", async () => { try { await browser?.close(); } catch {} server.close(() => process.exit(0)); });
+process.on("SIGINT",  async () => { try { await browser?.close(); } catch {} server.close(() => process.exit(0)); });
+
+// Optional tiny keep-alive (prevents some hosts from idling)
+setInterval(() => {}, 60_000);
