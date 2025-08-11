@@ -1,9 +1,8 @@
-// server.js — FINAL (defaults enabled)
+// server.js — FINAL with NSE warm-up + cookies + retries
 // Routes:
-//   /           -> status text
-//   /health     -> IST timestamp
-//   /nse        -> NSE snapshot (defaults: index="NIFTY 200", maxAge=900)
-//   /nse?index=NIFTY%2050&maxAge=600 -> override defaults
+//   /            -> status
+//   /health      -> IST timestamp
+//   /nse         -> NSE snapshot (defaults index="NIFTY 200", maxAge=900)
 
 import express from "express";
 import { setTimeout as delay } from "timers/promises";
@@ -12,7 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const TZ = "Asia/Kolkata";
 
-// ---------- helpers ----------
+/* ------------ time helpers ------------ */
 function nowISTISO() {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
@@ -21,7 +20,6 @@ function nowISTISO() {
   const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}+05:30`;
 }
-
 function parseNSETimeToIST(tsStr) {
   try {
     const [dpart, tpart] = tsStr.split(" ");
@@ -33,37 +31,66 @@ function parseNSETimeToIST(tsStr) {
     return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}+05:30`;
   } catch { return null; }
 }
-
 function freshness(istISO, maxAgeSec) {
   if (!istISO) return { ok:false, ageSec:Infinity, maxAgeSec };
   const ageSec = Math.max(0, Math.round((Date.now() - new Date(istISO).getTime())/1000));
   return { ok: ageSec <= maxAgeSec, ageSec, maxAgeSec };
 }
 
-async function fetchJSON(url, tries = 4) {
+/* ------------ headers & cookie jar ------------ */
+const BROWSER_HEADERS = {
+  "accept": "application/json, text/plain, */*",
+  "accept-language": "en-US,en;q=0.9",
+  "cache-control": "no-store",
+  "pragma": "no-cache",
+  "sec-ch-ua": "\"Chromium\";v=\"124\", \"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"124\"",
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": "\"Windows\"",
+  "sec-fetch-dest": "empty",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-site": "same-origin",
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+  "referer": "https://www.nseindia.com/"
+};
+
+async function warmUpAndGetCookies() {
+  const res = await fetch("https://www.nseindia.com/", { headers: BROWSER_HEADERS });
+  // collect cookies from set-cookie
+  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : res.headers.get("set-cookie");
+  if (!raw) return "";
+  // Join multiple Set-Cookie into a single Cookie header string
+  if (Array.isArray(raw)) {
+    return raw.map(c => c.split(";")[0]).join("; ");
+  } else {
+    return raw.split(",").map(c => c.split(";")[0]).join("; ");
+  }
+}
+
+async function fetchJSONWithCookies(url, tries = 3) {
   let lastErr;
-  for (let i=0; i<tries; i++) {
+  let cookie = "";
+  for (let i = 0; i < tries; i++) {
     try {
+      if (!cookie) cookie = await warmUpAndGetCookies();
       const res = await fetch(url, {
-        headers: {
-          "accept": "application/json, text/plain, */*",
-          "cache-control": "no-store",
-          "pragma": "no-cache",
-          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-          "referer": "https://www.nseindia.com/"
-        }
+        headers: { ...BROWSER_HEADERS, cookie }
       });
+      if (res.status === 401 || res.status === 403) {
+        // refresh cookies and retry
+        cookie = await warmUpAndGetCookies();
+        throw new Error(`HTTP ${res.status}`);
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
       lastErr = e;
-      await delay(400 * (i+1)); // backoff
+      await delay(500 * (i + 1));
     }
   }
   throw lastErr;
 }
 
-// ---------- routes ----------
+/* ------------ routes ------------ */
 app.get("/", (_req, res) =>
   res.type("text/plain").send("✅ NSE Relay is up. Try /health and /nse")
 );
@@ -72,16 +99,16 @@ app.get("/health", (_req, res) =>
   res.json({ ok:true, tz:TZ, now_ist: nowISTISO() })
 );
 
-// Defaults here mean /nse works with NO query params
+// Defaults: /nse works with NO params
 app.get("/nse", async (req, res) => {
   const index = (req.query.index ? String(req.query.index) : "NIFTY 200");
   const maxAge = Number(req.query.maxAge || 900); // seconds
+  const url = `https://www.nseindia.com/api/equity-stockIndices?index=${encodeURIComponent(index)}`;
 
   try {
-    const url = `https://www.nseindia.com/api/equity-stockIndices?index=${encodeURIComponent(index)}`;
-    const data = await fetchJSON(url);
+    const data = await fetchJSONWithCookies(url, 4);
 
-    const ts = data?.metadata?.lastUpdateTime || null;  // e.g., "11-Aug-2025 15:29:59"
+    const ts = data?.metadata?.lastUpdateTime || null; // "11-Aug-2025 15:29:59"
     const istISO = ts ? parseNSETimeToIST(ts) : null;
 
     // same-day guard (IST)
@@ -110,9 +137,9 @@ app.get("/nse", async (req, res) => {
       symbols: rows
     });
   } catch (e) {
-    res.status(503).json({ ok:false, error:"UPSTREAM_UNAVAILABLE", message: e.message });
+    res.status(503).json({ ok:false, error:"UPSTREAM_UNAVAILABLE", message: String(e.message || e) });
   }
 });
 
-// ---------- start ----------
+/* ------------ start ------------ */
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
